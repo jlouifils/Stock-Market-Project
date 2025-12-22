@@ -1,0 +1,3 @@
+# Copy to creds.py and replace with your real keys (do NOT commit creds.py)
+API_KEY = "your_paper_api_key_here"
+SECRET_KEY = "your_paper_api_secret_here"
