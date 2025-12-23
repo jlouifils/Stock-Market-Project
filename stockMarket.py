@@ -11,8 +11,10 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import f1_score
 import joblib
 import alpaca_trade_api as tradeapi
+from core.risk import RiskManager
+from core.portfolio import Portfolio
+from core.alerts import send_alert
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ---------------- CONFIG ----------------
 # Load API credentials from environment if available (preferred)
@@ -24,6 +26,16 @@ INITIAL_CAPITAL = 100_000
 RISK_PER_TRADE = 0.01
 MAX_DRAWDOWN = 0.05
 FEATURE_COLS = ['atr','ema20','ema50','rsi']
+
+risk = RiskManager(
+    max_drawdown=0.10,
+    stop_loss_pct=0.03
+)
+
+portfolio = Portfolio(initial_cash=INITIAL_CAPITAL)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 # ---------------- CONNECT TO ALPACA ----------------
 try:
@@ -44,14 +56,6 @@ if not API_KEY or API_KEY.startswith("YOUR_") or not API_SECRET or API_SECRET.st
         "If you use VS Code, add the env vars to your launch configuration or system/user environment."
     )
     sys.exit(1)
-
-# ---------------- PORTFOLIO STATE ----------------
-portfolio = {
-    "cash": INITIAL_CAPITAL,
-    "shares": {t:0 for t in TICKERS},
-    "equity_curve": [],
-    "history": []
-}
 
 # ---------------- STOCK ORDER UTILITY ----------------
 def place_stock_order(symbol, qty, side='buy'):
@@ -172,28 +176,77 @@ ml_model = train_ml(df_dict)
 
 # ---------------- LIVE BAR HANDLER ----------------
 async def handle_bar(bar):
-    t = bar.symbol
+    symbol = bar.symbol
     price = bar.close
-    df = df_dict[t]
-    latest_row = df.iloc[-1]
+
+    # Get dataframe and base last row for feature construction
+    df = df_dict[symbol]
+    last = df.iloc[-1].copy()
+
+    # Update last row with new bar values (if present on bar)
+    last['close'] = price
+    if hasattr(bar, 'high'):
+        last['high'] = bar.high
+    if hasattr(bar, 'low'):
+        last['low'] = bar.low
+
+    # Recompute derived features using recent history + this bar
+    recent_closes = pd.concat([df['close'], pd.Series([price])], ignore_index=True)
+    last['atr'] = last['high'] - last['low']
+    last['ema20'] = recent_closes.ewm(span=20).mean().iloc[-1]
+    last['ema50'] = recent_closes.ewm(span=50).mean().iloc[-1]
+    last['rsi'] = rsi(recent_closes).iloc[-1]
+
+    entry_signal = (last['close'] > last['ema20']) and (last['ema20'] > last['ema50'])
+    exit_signal = last['close'] < last['ema20']
+
     try:
-        regime = ml_model.predict([latest_row[FEATURE_COLS].values])[0]
-        # Entry
-        if latest_row['entry_signal'] and regime==1 and portfolio['shares'][t]==0:
-            qty = int((portfolio['cash']*RISK_PER_TRADE)/price)
-            if qty>0 and place_stock_order(t, qty,'buy'):
-                portfolio['shares'][t] += qty
-                portfolio['cash'] -= qty*price
-                portfolio['history'].append(f"BUY {qty} {t}@{price:.2f}")
-        # Exit
-        if latest_row['exit_signal'] and portfolio['shares'][t]>0:
-            qty = portfolio['shares'][t]
-            if place_stock_order(t, qty,'sell'):
-                portfolio['shares'][t]=0
-                portfolio['cash']+=qty*price
-                portfolio['history'].append(f"SELL {qty} {t}@{price:.2f}")
+        features = last[FEATURE_COLS].values.reshape(1, -1)
+        regime = ml_model.predict(features)[0]
+
+        # ENTRY
+        if entry_signal and regime == 1 and symbol not in portfolio.positions:
+            qty = int((portfolio.cash * RISK_PER_TRADE) / price)
+            if qty > 0:
+                position_value = qty * price
+                total_equity = portfolio.total_equity({s: price for s in TICKERS})
+                if risk.position_size_allowed(position_value, total_equity) and \
+                   risk.portfolio_exposure_allowed(portfolio.total_exposure({s: price for s in TICKERS}) + position_value, total_equity):
+                    if place_stock_order(symbol, qty, 'buy'):
+                        portfolio.open_position(symbol, qty, price)
+                        logging.info(f"Opened {symbol} x{qty} @ {price:.2f}")
+
+        # EXIT
+        if exit_signal and symbol in portfolio.positions:
+            pos = portfolio.positions[symbol]
+            qty = pos['qty']
+            if place_stock_order(symbol, qty, 'sell'):
+                pnl = portfolio.close_position(symbol, price, "EXIT_SIGNAL")
+                logging.info(f"Closed {symbol} x{qty} @ {price:.2f} pnl={pnl:.2f}")
+
     except Exception as e:
-        logging.error(f"Error processing bar for {t}: {e}")
+        logging.error(f"Error processing bar for {symbol}: {e}")
+
+    # Update risk & enforce safety checks using current price_map
+    price_map = {s: price for s in TICKERS}
+    equity = portfolio.total_equity(price_map)
+    risk.update_equity(equity)
+
+    # HARD KILL SWITCH
+    if risk.check_drawdown():
+        for sym, pos in list(portfolio.positions.items()):
+            place_stock_order(sym, pos["qty"], "sell")
+            portfolio.close_position(sym, price, "MAX_DRAWDOWN")
+            send_alert("FORCED LIQUIDATION — MAX DRAWDOWN", "RISK")
+        return
+
+    # STOP-LOSS check
+    for sym, pos in list(portfolio.positions.items()):
+        if risk.check_stop_loss(pos["entry_price"], price):
+            place_stock_order(sym, pos["qty"], "sell")
+            portfolio.close_position(sym, price, "STOP_LOSS")
+            send_alert(f"STOP LOSS HIT — {sym}", "RISK")
+
 
 # ---------------- START STREAM ----------------
 stream = tradeapi.Stream(API_KEY, API_SECRET, base_url=BASE_URL, data_feed='iex')
