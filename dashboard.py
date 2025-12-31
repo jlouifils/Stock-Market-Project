@@ -1,173 +1,184 @@
-import dash
-from dash import dcc, html, Input, Output, State, dash_table
-import plotly.graph_objs as go
-import pandas as pd
-import alpaca_trade_api as tradeapi
+# dashboard.py
 import os
-from datetime import datetime
+import pandas as pd
+import plotly.graph_objects as go
+from dash import Dash, dcc, html
+from dash.dependencies import Input, Output
 
-# ==============================
-# Alpaca Connection
-# ==============================
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = "https://paper-api.alpaca.markets"
-
-alpaca = tradeapi.REST(API_KEY, API_SECRET, BASE_URL, api_version="v2")
-
-# ==============================
-# Dash App
-# ==============================
-app = dash.Dash(__name__)
-app.title = "Live Trading Dashboard"
-
-# ==============================
-# Layout
-# ==============================
-app.layout = html.Div(
-    style={"backgroundColor": "#0e0e0e", "color": "white", "padding": "20px"},
-    children=[
-        html.H2("📈 Live Trading Dashboard"),
-
-        html.Div(id="account-summary", style={"marginBottom": "20px"}),
-
-        dcc.Graph(id="equity-curve"),
-
-        html.H3("Manual Trading"),
-        html.Div([
-            dcc.Input(id="trade-symbol", placeholder="Symbol", value="AAPL"),
-            dcc.Input(id="trade-qty", placeholder="Qty", type="number", value=10),
-            html.Button("BUY", id="buy-btn", n_clicks=0),
-            html.Button("SELL", id="sell-btn", n_clicks=0),
-            html.Div(id="trade-status")
-        ], style={"marginBottom": "30px"}),
-
-        html.H3("Open Positions"),
-        dash_table.DataTable(
-            id="positions-table",
-            style_table={"overflowX": "auto"},
-            style_cell={"backgroundColor": "#111", "color": "white"},
-            style_header={"backgroundColor": "#222", "fontWeight": "bold"},
-        ),
-
-        html.H3("Recent Orders"),
-        dash_table.DataTable(
-            id="orders-table",
-            style_table={"overflowX": "auto"},
-            style_cell={"backgroundColor": "#111", "color": "white"},
-            style_header={"backgroundColor": "#222", "fontWeight": "bold"},
-        ),
-
-        dcc.Interval(id="refresh", interval=10_000, n_intervals=0)
-    ]
+from state_store import (
+    init_db, get_engine_state, get_latest_universe,
+    get_latest_risk, get_risk_series, get_positions,
+    get_orders, get_signals, get_decisions
 )
 
-# ==============================
-# Callbacks
-# ==============================
+PORT = int(os.getenv("DASH_PORT", "8050"))
 
-@app.callback(
-    Output("account-summary", "children"),
-    Output("equity-curve", "figure"),
-    Output("positions-table", "data"),
-    Output("positions-table", "columns"),
-    Output("orders-table", "data"),
-    Output("orders-table", "columns"),
-    Input("refresh", "n_intervals"),
-)
-def update_dashboard(_):
-    account = alpaca.get_account()
+init_db()
+app = Dash(__name__)
+app.title = "Trading Dashboard"
 
-    # ----- Equity Curve -----
-    history = alpaca.get_portfolio_history(period="1D", timeframe="5Min")
-    equity_df = pd.DataFrame({
-        "time": pd.to_datetime(history.timestamp, unit="s"),
-        "equity": history.equity
+
+def badge(text, color):
+    return html.Span(text, style={
+        "display": "inline-block",
+        "padding": "6px 10px",
+        "borderRadius": "999px",
+        "background": color,
+        "color": "white",
+        "fontWeight": "700",
+        "marginRight": "8px",
+        "fontSize": "12px"
     })
 
-    equity_fig = go.Figure()
-    equity_fig.add_trace(go.Scatter(
-        x=equity_df["time"],
-        y=equity_df["equity"],
-        mode="lines",
-        name="Equity"
-    ))
-    equity_fig.update_layout(
-        template="plotly_dark",
-        margin=dict(l=20, r=20, t=30, b=20)
-    )
 
-    # ----- Positions -----
-    positions = alpaca.list_positions()
-    pos_rows = []
-    for p in positions:
-        pos_rows.append({
-            "Symbol": p.symbol,
-            "Qty": p.qty,
-            "Entry": float(p.avg_entry_price),
-            "Price": float(p.current_price),
-            "Market Value": float(p.market_value),
-            "P/L": float(p.unrealized_pl)
-        })
+def card(title, children):
+    return html.Div([
+        html.Div(title, style={"fontWeight": "800", "marginBottom": "8px"}),
+        html.Div(children)
+    ], style={
+        "background": "#111827",
+        "color": "#E5E7EB",
+        "borderRadius": "14px",
+        "padding": "14px",
+        "boxShadow": "0 6px 18px rgba(0,0,0,0.25)"
+    })
 
-    pos_cols = [{"name": c, "id": c} for c in pos_rows[0].keys()] if pos_rows else []
 
-    # ----- Orders -----
-    orders = alpaca.list_orders(limit=20, status="all")
-    order_rows = []
-    for o in orders:
-        order_rows.append({
-            "Symbol": o.symbol,
-            "Side": o.side,
-            "Qty": o.qty,
-            "Filled Avg": o.filled_avg_price,
-            "Status": o.status,
-            "Time": o.submitted_at.strftime("%Y-%m-%d %H:%M:%S")
-        })
+def table_from_rows(rows):
+    if not rows:
+        return html.Div("No data yet.")
+    df = pd.DataFrame(rows)
+    return html.Div([
+        html.Table([
+            html.Thead(html.Tr([html.Th(c) for c in df.columns])),
+            html.Tbody([
+                html.Tr([html.Td(str(df.iloc[i][c])) for c in df.columns])
+                for i in range(min(len(df), 25))
+            ])
+        ], style={"width": "100%", "borderCollapse": "collapse"})
+    ], style={"overflowX": "auto"})
 
-    order_cols = [{"name": c, "id": c} for c in order_rows[0].keys()] if order_rows else []
 
-    summary = html.Div([
-        html.B(f"Equity: ${float(account.equity):,.2f}"),
-        html.Span(" | "),
-        html.B(f"Cash: ${float(account.cash):,.2f}")
-    ])
+app.layout = html.Div([
+    html.Div([
+        html.Div("Alpaca-style Trading Dashboard", style={
+            "fontSize": "20px", "fontWeight": "900", "color": "#111827"
+        }),
+        html.Div(id="badges", style={"marginTop": "10px"})
+    ], style={"padding": "16px"}),
 
-    return summary, equity_fig, pos_rows, pos_cols, order_rows, order_cols
+    html.Div([
+        html.Div(id="top_cards", style={
+            "display": "grid",
+            "gridTemplateColumns": "repeat(4, 1fr)",
+            "gap": "12px",
+            "padding": "0 16px 16px 16px"
+        }),
+    ]),
+
+    html.Div([
+        html.Div([
+            dcc.Graph(id="equity_chart", config={"displayModeBar": False})
+        ], style={"background": "white", "borderRadius": "14px", "padding": "12px", "margin": "0 16px"}),
+
+        html.Div([
+            html.Div([
+                html.H3("Positions", style={"margin": "0 0 8px 0"}),
+                html.Div(id="positions_tbl")
+            ], style={"background": "white", "borderRadius": "14px", "padding": "12px", "margin": "12px 16px"}),
+
+            html.Div([
+                html.H3("Orders", style={"margin": "0 0 8px 0"}),
+                html.Div(id="orders_tbl")
+            ], style={"background": "white", "borderRadius": "14px", "padding": "12px", "margin": "12px 16px"}),
+
+            html.Div([
+                html.H3("Signals", style={"margin": "0 0 8px 0"}),
+                html.Div(id="signals_tbl")
+            ], style={"background": "white", "borderRadius": "14px", "padding": "12px", "margin": "12px 16px"}),
+
+            html.Div([
+                html.H3("Decisions (latest)", style={"margin": "0 0 8px 0"}),
+                html.Div(id="decisions_tbl")
+            ], style={"background": "white", "borderRadius": "14px", "padding": "12px", "margin": "12px 16px"}),
+        ])
+    ]),
+
+    dcc.Interval(id="tick", interval=1500, n_intervals=0)
+], style={"fontFamily": "system-ui, Segoe UI, Arial", "background": "#F3F4F6"})
 
 
 @app.callback(
-    Output("trade-status", "children"),
-    Input("buy-btn", "n_clicks"),
-    Input("sell-btn", "n_clicks"),
-    State("trade-symbol", "value"),
-    State("trade-qty", "value"),
+    Output("badges", "children"),
+    Output("top_cards", "children"),
+    Output("equity_chart", "figure"),
+    Output("positions_tbl", "children"),
+    Output("orders_tbl", "children"),
+    Output("signals_tbl", "children"),
+    Output("decisions_tbl", "children"),
+    Input("tick", "n_intervals"),
 )
-def trade(buy, sell, symbol, qty):
-    ctx = dash.callback_context
-    if not ctx.triggered:
-        return ""
+def refresh(_):
+    eng = get_engine_state() or {}
+    uni = get_latest_universe() or {}
+    risk = get_latest_risk() or {}
+    series = get_risk_series(400)
 
-    side = "buy" if ctx.triggered_id == "buy-btn" else "sell"
+    trading_on = bool(eng.get("trading_enabled", 0))
+    kill = bool(eng.get("kill_switch", 0))
 
-    try:
-        alpaca.submit_order(
-            symbol=symbol.upper(),
-            qty=int(qty),
-            side=side,
-            type="market",
-            time_in_force="day"
+    badges = []
+    badges.append(badge(f"TRADING {'ON' if trading_on else 'OFF'}", "#059669" if trading_on else "#6B7280"))
+    badges.append(badge(f"KILL {'TRIPPED' if kill else 'OK'}", "#DC2626" if kill else "#2563EB"))
+    if uni.get("symbols"):
+        badges.append(badge(f"UNIVERSE {len(uni['symbols'].split(','))}", "#111827"))
+    if eng.get("last_resync_ts"):
+        badges.append(badge(f"RESYNC {eng['last_resync_ts']}", "#7C3AED"))
+    if eng.get("last_enforce_action"):
+        badges.append(badge(f"ENFORCE {eng['last_enforce_action']}", "#F59E0B"))
+
+    # Top cards
+    equity = float(risk.get("equity", 0.0) or 0.0)
+    cash = float(risk.get("cash", 0.0) or 0.0)
+    bp = float(risk.get("buying_power", 0.0) or 0.0)
+    dd = float(risk.get("drawdown_pct", 0.0) or 0.0)
+    gross = float(risk.get("gross_exposure", 0.0) or 0.0)
+    invested = float(risk.get("invested_pct", 0.0) or 0.0)
+
+    cards = [
+        card("Equity", f"${equity:,.2f}"),
+        card("Cash", f"${cash:,.2f}"),
+        card("Buying Power", f"${bp:,.2f}"),
+        card("Drawdown", f"{dd*100:,.2f}%"),
+    ]
+
+    # Equity chart
+    if series:
+        df = pd.DataFrame(series)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["ts"], y=df["equity"], mode="lines", name="Equity"))
+        fig.update_layout(
+            margin=dict(l=20, r=20, t=20, b=20),
+            height=320,
+            paper_bgcolor="white",
+            plot_bgcolor="white",
+            xaxis=dict(showgrid=False),
+            yaxis=dict(showgrid=True, gridcolor="rgba(0,0,0,0.08)")
         )
-        return f"Order submitted: {side.upper()} {qty} {symbol}"
-    except Exception as e:
-        return str(e)
+    else:
+        fig = go.Figure()
+        fig.update_layout(height=320, margin=dict(l=20, r=20, t=20, b=20))
+
+    positions_tbl = table_from_rows(get_positions())
+    orders_tbl = table_from_rows(get_orders(120))
+    signals_tbl = table_from_rows(get_signals())
+    decisions_tbl = table_from_rows(get_decisions(120))
+
+    return badges, cards, fig, positions_tbl, orders_tbl, signals_tbl, decisions_tbl
 
 
-# ==============================
-# Run
-# ==============================
 def run_dashboard():
-    app.run(debug=False)
+    app.run(host="127.0.0.1", port=PORT, debug=False)
 
 
 if __name__ == "__main__":
